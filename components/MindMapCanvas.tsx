@@ -1,5 +1,5 @@
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import * as d3 from 'd3';
 import { Card } from '../types';
 
@@ -11,207 +11,290 @@ interface MindMapCanvasProps {
   onAddManual: (id: string) => void;
 }
 
-const CARD_WIDTH = 200;
-const CARD_HEIGHT = 70;
-const HORIZONTAL_SPACING = 280;
-const VERTICAL_LIST_SPACING = 100;
-const INDENT_SIZE = 120; // Increased to allow space for the "Bottom-to-Left" connection
+const CARD_W = 160;
+const CARD_H = 46;
+const L1_H_GAP = 50; 
+const VERTICAL_STEP = 32; 
+const CHILD_V_GAP = 12; 
+
+interface RenderNode extends Card {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  depth: number;
+  children: RenderNode[];
+}
 
 const MindMapCanvas: React.FC<MindMapCanvasProps> = ({ data, onExpand, onDelete, onEdit, onAddManual }) => {
-  const svgRef = useRef<SVGSVGElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const zoomRef = useRef<any>(null);
-  const [zoomLevel, setZoomLevel] = useState(0.8);
+  const [transform, setTransform] = useState(d3.zoomIdentity);
+  const renderNodesRef = useRef<RenderNode[]>([]);
+  
+  // 处理高清缩放
+  const getDpr = () => (typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1);
 
-  const getDepthColor = (depth: number) => {
-    const colors = [
-      'bg-indigo-600 border-indigo-700 text-white',
-      'bg-indigo-50 border-indigo-200 text-indigo-900',
-      'bg-white border-slate-200 text-slate-700',
-      'bg-white border-slate-100 text-slate-500',
-    ];
-    return colors[Math.min(depth, colors.length - 1)];
-  };
+  // 计算子树总高度
+  const getSubTreeHeight = useCallback((node: RenderNode): number => {
+    if (!node.children || node.children.length === 0) return CARD_H;
+    let h = CARD_H + CHILD_V_GAP;
+    node.children.forEach(c => {
+      h += getSubTreeHeight(c) + CHILD_V_GAP;
+    });
+    return h;
+  }, []);
 
-  const handleReset = () => {
-    if (svgRef.current && zoomRef.current) {
-      const width = containerRef.current?.clientWidth || 1200;
-      d3.select(svgRef.current)
-        .transition()
-        .duration(750)
-        .call(zoomRef.current.transform, d3.zoomIdentity.translate(width / 2, 80).scale(0.8));
-    }
-  };
+  // 核心布局逻辑：L1横向，L2+右下阶梯
+  const calculateLayout = useCallback((node: Card, depth: number, xOffset: number, yOffset: number): RenderNode => {
+    const rNode: RenderNode = { 
+      ...node, 
+      depth, 
+      x: xOffset, 
+      y: yOffset, 
+      width: CARD_W, 
+      height: CARD_H,
+      children: [] 
+    };
 
-  useEffect(() => {
-    if (!svgRef.current || !data) return;
+    if (!node.children || node.children.length === 0) return rNode;
 
-    const svg = d3.select(svgRef.current);
-    let g = svg.select<SVGGElement>("g.main-group");
-    if (g.empty()) {
-      g = svg.append("g").attr("class", "main-group");
-    }
-
-    const zoomBehavior = d3.zoom<SVGSVGElement, unknown>()
-      .scaleExtent([0.1, 4])
-      .on("zoom", (event) => {
-        g.attr("transform", event.transform);
-        setZoomLevel(event.transform.k);
+    if (depth === 0) {
+      // Root -> Level 1 (横向)
+      let currentX = xOffset;
+      rNode.children = node.children.map((child) => {
+        const childNode = calculateLayout(child, depth + 1, currentX, yOffset + 140);
+        currentX += CARD_W + L1_H_GAP;
+        return childNode;
       });
-
-    zoomRef.current = zoomBehavior;
-    svg.call(zoomBehavior as any);
-
-    const root = d3.hierarchy(data);
-
-    // --- CUSTOM HYBRID LAYOUT LOGIC ---
-    // 1. Root at (0, 0)
-    root.x = 0;
-    root.y = 0;
-
-    if (root.children) {
-      const numLevel2 = root.children.length;
-      const totalWidth = (numLevel2 - 1) * HORIZONTAL_SPACING;
-      
-      root.children.forEach((child, i) => {
-        // 2. Level 2 nodes spread horizontally
-        child.x = -totalWidth / 2 + i * HORIZONTAL_SPACING;
-        child.y = 150;
-
-        // 3. Level 3+ nodes arranged vertically under their parent
-        let verticalOffset = 1;
-        const layoutSubtree = (node: d3.HierarchyNode<Card>, parentX: number, startY: number) => {
-          if (!node.children) return;
-          node.children.forEach((leaf) => {
-            leaf.x = parentX + INDENT_SIZE;
-            leaf.y = startY + verticalOffset * VERTICAL_LIST_SPACING;
-            verticalOffset++;
-            // Pass the same startY for the branch to keep them relative to the Level 2 node's baseline
-            // or pass leaf.y if we want cascading vertical offsets. Here we use leaf.y for the next level.
-            layoutSubtree(leaf, leaf.x, startY);
-          });
-        };
-        layoutSubtree(child, child.x, child.y);
+      // 根节点居中于其子节点
+      const firstChild = rNode.children[0];
+      const lastChild = rNode.children[rNode.children.length - 1];
+      rNode.x = (firstChild.x + lastChild.x) / 2;
+    } else {
+      // Level 1+ -> Level 2+ (阶梯纵向)
+      let currentY = yOffset + CARD_H + CHILD_V_GAP;
+      rNode.children = node.children.map((child) => {
+        const childNode = calculateLayout(child, depth + 1, xOffset + VERTICAL_STEP, currentY);
+        currentY += getSubTreeHeight(childNode) + CHILD_V_GAP;
+        return childNode;
       });
     }
+    return rNode;
+  }, [getSubTreeHeight]);
 
-    // --- RENDER LINKS ---
-    const links = g.selectAll<SVGPathElement, d3.HierarchyLink<Card>>("path.link")
-      .data(root.links(), d => (d.target.data as any).id);
+  const flatten = (node: RenderNode, list: RenderNode[]) => {
+    list.push(node);
+    if (node.children) node.children.forEach(c => flatten(c, list));
+  };
 
-    links.enter()
-      .append("path")
-      .attr("class", "link")
-      .attr("fill", "none")
-      .attr("stroke", "#cbd5e1")
-      .attr("stroke-width", 2)
-      .merge(links as any)
-      .transition().duration(500)
-      .attr("d", (d: any) => {
-        if (d.source.depth === 0) {
-          // Curved link: Root Bottom -> Level 2 Top
-          return d3.linkVertical()
-            .source(() => [d.source.x, d.source.y + CARD_HEIGHT / 2])
-            .target(() => [d.target.x, d.target.y - CARD_HEIGHT / 2])(d);
+  const render = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !containerRef.current) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const dpr = getDpr();
+    ctx.clearRect(0, 0, canvas.width / dpr, canvas.height / dpr);
+    ctx.save();
+    
+    // 应用 Zoom 变换
+    ctx.translate(transform.x, transform.y);
+    ctx.scale(transform.k, transform.k);
+
+    const nodes = renderNodesRef.current;
+
+    // 1. 连线绘制
+    ctx.beginPath();
+    ctx.strokeStyle = '#94a3b8';
+    ctx.lineWidth = 1.2;
+    nodes.forEach(node => {
+      node.children.forEach(child => {
+        if (node.depth === 0) {
+          // L1 曲线
+          ctx.moveTo(node.x + CARD_W / 2, node.y + CARD_H);
+          ctx.bezierCurveTo(
+            node.x + CARD_W / 2, node.y + 100,
+            child.x + CARD_W / 2, child.y - 40,
+            child.x + CARD_W / 2, child.y
+          );
         } else {
-          // Elbow Link: Parent Bottom -> Child Left
-          const startX = d.source.x;
-          const startY = d.source.y + CARD_HEIGHT / 2;
-          const endX = d.target.x - CARD_WIDTH / 2;
-          const endY = d.target.y;
-          
-          // Move from bottom of parent, straight down to child's vertical level, then right to left edge
-          return `M${startX},${startY} V${endY} H${endX}`;
+          // L2+ 阶梯线
+          const startX = node.x + 20; 
+          const startY = node.y + CARD_H;
+          const endX = child.x;
+          const endY = child.y + CARD_H / 2;
+          ctx.moveTo(startX, startY);
+          ctx.lineTo(startX, endY);
+          ctx.lineTo(endX, endY);
         }
       });
+    });
+    ctx.stroke();
 
-    links.exit().remove();
+    // 2. 卡片绘制
+    nodes.forEach(node => {
+      const { x, y, message, depth, isExpanding } = node;
+      
+      ctx.save();
+      
+      // 卡片阴影
+      ctx.shadowColor = 'rgba(0,0,0,0.06)';
+      ctx.shadowBlur = 10;
+      ctx.shadowOffsetY = 4;
 
-    // --- RENDER NODES ---
-    const nodes = g.selectAll<SVGGElement, d3.HierarchyNode<Card>>("g.node")
-      .data(root.descendants(), d => (d.data as any).id);
+      // 卡片圆角矩形
+      ctx.beginPath();
+      ctx.roundRect(x, y, CARD_W, CARD_H, 10);
+      if (depth === 0) ctx.fillStyle = '#1e293b';
+      else if (depth === 1) ctx.fillStyle = '#4f46e5';
+      else ctx.fillStyle = '#ffffff';
+      ctx.fill();
+      
+      ctx.shadowBlur = 0;
+      ctx.shadowOffsetY = 0;
+      ctx.strokeStyle = depth > 1 ? '#e2e8f0' : 'transparent';
+      ctx.lineWidth = 1;
+      ctx.stroke();
 
-    const nodeEnter = nodes.enter()
-      .append("g")
-      .attr("class", "node")
-      .attr("transform", d => `translate(${d.x},${d.y})`)
-      .attr("opacity", 0);
+      // 精确文字渲染
+      ctx.fillStyle = (depth === 0 || depth === 1) ? '#ffffff' : '#334155';
+      ctx.font = `${depth === 0 ? '700' : '500'} 13px "Inter", -apple-system, sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      const displayMsg = message.length > 20 ? message.slice(0, 18) + '...' : message;
+      ctx.fillText(displayMsg, x + CARD_W / 2, y + CARD_H / 2);
 
-    const fo = nodeEnter.append("foreignObject")
-      .attr("width", CARD_WIDTH + 60)
-      .attr("height", CARD_HEIGHT + 40)
-      .attr("x", -CARD_WIDTH / 2)
-      .attr("y", -CARD_HEIGHT / 2);
+      // 操作按钮 (+)
+      ctx.fillStyle = '#10b981';
+      ctx.beginPath();
+      ctx.arc(x + CARD_W, y + 12, 10, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = 'white';
+      ctx.font = 'bold 12px Arial';
+      ctx.fillText('+', x + CARD_W, y + 13);
 
-    fo.append("xhtml:div")
-      .attr("class", "p-1 h-full w-full")
-      .html((d: any) => {
-        const loadingClass = d.data.isExpanding ? 'ring-4 ring-indigo-500/20' : '';
-        const shadowClass = d.depth === 0 ? 'shadow-indigo-100' : 'shadow-slate-100';
-        const textAlignment = d.depth > 1 ? 'text-left' : 'text-center';
-        
-        return `
-        <div class="card-body group relative flex items-center justify-center w-[${CARD_WIDTH}px] h-[${CARD_HEIGHT}px] px-4 py-2 rounded-xl border-2 shadow-lg transition-all duration-300 hover:scale-105 ${getDepthColor(d.depth)} ${loadingClass} ${shadowClass}">
-          <p class="text-[12px] font-bold leading-tight ${textAlignment} select-none truncate-2-lines w-full">${d.data.message}</p>
-          
-          <div class="absolute -right-8 top-1/2 -translate-y-1/2 flex flex-col gap-1 opacity-0 group-hover:opacity-100 transition-opacity z-50">
-            <button class="expand-btn w-7 h-7 bg-indigo-600 text-white rounded-lg flex items-center justify-center shadow-md hover:bg-indigo-700 active:scale-90">
-              <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
-            </button>
-            <button class="add-manual-btn w-7 h-7 bg-white border border-slate-200 text-slate-400 rounded-lg flex items-center justify-center shadow-md hover:text-indigo-600 active:scale-90">
-              <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M12 4v16m8-8H4" /></svg>
-            </button>
-          </div>
+      // AI 按钮
+      if (isExpanding) {
+        ctx.fillStyle = '#f59e0b';
+        ctx.beginPath();
+        ctx.arc(x + CARD_W, y + CARD_H - 12, 10, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = 'white';
+        ctx.font = '8px Arial';
+        ctx.fillText('...', x + CARD_W, y + CARD_H - 12);
+      } else {
+        ctx.fillStyle = '#6366f1';
+        ctx.beginPath();
+        ctx.arc(x + CARD_W, y + CARD_H - 12, 10, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = 'white';
+        ctx.font = '9px Arial';
+        ctx.fillText('AI', x + CARD_W, y + CARD_H - 11);
+      }
 
-          ${d.data.isExpanding ? `
-            <div class="absolute inset-0 flex items-center justify-center bg-white/60 rounded-xl">
-               <div class="w-4 h-4 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin"></div>
-            </div>
-          ` : ''}
-        </div>
-      `});
-
-    nodeEnter.on("click", (e, d) => {
-      const target = e.target as HTMLElement;
-      if (target.closest('.expand-btn')) onExpand(d.data.id, d.data.message);
-      else if (target.closest('.add-manual-btn')) onAddManual(d.data.id);
+      ctx.restore();
     });
 
-    nodeEnter.on("dblclick", (e, d) => {
-      e.stopPropagation();
-      const newMsg = prompt("Rename node:", d.data.message);
-      if (newMsg) onEdit(d.data.id, newMsg);
-    });
+    ctx.restore();
+  }, [transform]);
 
-    nodeEnter.on("contextmenu", (e, d) => {
-      e.preventDefault();
-      if (confirm(`Delete this branch?`)) onDelete(d.data.id);
-    });
+  useEffect(() => {
+    const root = calculateLayout(data, 0, 100, 80);
+    const list: RenderNode[] = [];
+    flatten(root, list);
+    renderNodesRef.current = list;
+    render();
+  }, [data, calculateLayout, render]);
 
-    nodes.merge(nodeEnter as any)
-      .transition().duration(500)
-      .attr("opacity", 1)
-      .attr("transform", d => `translate(${d.x},${d.y})`);
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const container = containerRef.current;
+    if (!canvas || !container) return;
 
-    nodes.exit().transition().duration(300).attr("opacity", 0).remove();
+    const handleResize = () => {
+      const dpr = getDpr();
+      const width = container.clientWidth;
+      const height = container.clientHeight;
+      
+      canvas.width = width * dpr;
+      canvas.height = height * dpr;
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
+      
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.scale(dpr, dpr); 
+        render();
+      }
+    };
 
-    if (svg.attr("data-initialized") !== "true") {
-      const width = containerRef.current?.clientWidth || 1200;
-      svg.call(zoomBehavior.transform as any, d3.zoomIdentity.translate(width / 2, 80).scale(0.8));
-      svg.attr("data-initialized", "true");
+    const zoom = d3.zoom<HTMLCanvasElement, unknown>()
+      .scaleExtent([0.1, 4])
+      .on('zoom', (event) => setTransform(event.transform));
+
+    d3.select(canvas).call(zoom);
+    
+    const resizeObserver = new ResizeObserver(handleResize);
+    resizeObserver.observe(container);
+    handleResize();
+
+    return () => resizeObserver.disconnect();
+  }, [render]);
+
+  const handleClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const rect = canvasRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const mouseX = (e.clientX - rect.left - transform.x) / transform.k;
+    const mouseY = (e.clientY - rect.top - transform.y) / transform.k;
+
+    for (let i = renderNodesRef.current.length - 1; i >= 0; i--) {
+      const node = renderNodesRef.current[i];
+      
+      const plusBtnDist = Math.hypot(mouseX - (node.x + CARD_W), mouseY - (node.y + 12));
+      if (plusBtnDist < 12) {
+        onAddManual(node.id);
+        return;
+      }
+
+      const aiBtnDist = Math.hypot(mouseX - (node.x + CARD_W), mouseY - (node.y + CARD_H - 12));
+      if (aiBtnDist < 12) {
+        onExpand(node.id, node.message);
+        return;
+      }
+
+      if (mouseX >= node.x && mouseX <= node.x + CARD_W && mouseY >= node.y && mouseY <= node.y + CARD_H) {
+        if (e.altKey) {
+          onDelete(node.id);
+        } else {
+          const newMsg = prompt("修改文本:", node.message);
+          if (newMsg) onEdit(node.id, newMsg);
+        }
+        return;
+      }
     }
-
-  }, [data, onExpand, onDelete, onEdit, onAddManual]);
+  };
 
   return (
-    <div ref={containerRef} className="w-full h-full relative bg-slate-50/50">
-      <div className="absolute top-6 right-6 z-20 flex flex-col gap-3">
-        <button onClick={handleReset} className="p-3 bg-white border border-slate-200 rounded-2xl shadow-sm text-slate-600 hover:text-indigo-600 transition-all font-bold text-xs flex items-center gap-2">
-           <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" /></svg>
-           Recenter View
-        </button>
+    <div ref={containerRef} className="w-full h-full bg-[#f8fafc] relative overflow-hidden">
+      <canvas 
+        ref={canvasRef} 
+        onClick={handleClick} 
+        className="block cursor-grab active:cursor-grabbing touch-none" 
+      />
+      <div className="absolute top-6 left-6 pointer-events-none">
+        <div className="bg-white/80 backdrop-blur-md px-4 py-3 rounded-2xl border border-slate-200 shadow-sm space-y-2">
+          <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">布局说明 (Mixed Layout)</p>
+          <div className="flex items-center gap-4 text-[11px] font-semibold text-slate-600">
+            <span className="flex items-center gap-1.5"><div className="w-2.5 h-2.5 rounded-full bg-indigo-600"></div> L1: 横向</span>
+            <span className="flex items-center gap-1.5"><div className="w-2.5 h-2.5 rounded-full bg-emerald-500"></div> L2+: 阶梯</span>
+          </div>
+        </div>
       </div>
-      <svg ref={svgRef} className="w-full h-full cursor-grab active:cursor-grabbing" />
+      
+      <div className="absolute bottom-6 right-6 flex items-center gap-2 px-3 py-1.5 bg-slate-100/80 backdrop-blur rounded-full text-[10px] text-slate-400 font-mono">
+        <span>Canvas Resolution: {(getDpr()).toFixed(1)}x</span>
+      </div>
     </div>
   );
 };
