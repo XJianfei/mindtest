@@ -1,0 +1,5 @@
+{
+  "name": "Gemini Mind Mapper",
+  "description": "An AI-powered mind mapping tool that generates and expands complex structured ideas using Gemini 3 Flash. Built with React, Tailwind CSS, and D3.js for fluid visualizations.",
+  "requestFramePermissions": []
+}
